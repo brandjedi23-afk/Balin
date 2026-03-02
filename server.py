@@ -305,7 +305,9 @@ def api_get_state(campaign_id: str, x_api_key: Optional[str] = Header(default=No
 
     root = campaign_root(campaign_id)
     if not root.exists():
-        raise HTTPException(status_code=404, detail="Campaign not found")
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
 
     paths = ensure_campaign_dirs(campaign_id)
     default_state = {
