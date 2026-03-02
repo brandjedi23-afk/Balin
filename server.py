@@ -5,7 +5,7 @@ import uuid
 import random
 import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import fcntl
 from fastapi import FastAPI, Header, HTTPException
@@ -306,7 +306,7 @@ class UpsertNPCReq(BaseModel):
 
 class ListResp(BaseModel):
     campaign_id: str
-    ids: List[str]
+    ids: list[str]
 
 
 # =========================
@@ -519,7 +519,7 @@ def upsert_npc(
     return {"ok": True, "campaign_id": req.campaign_id, "npc_id": req.npc_id}
 
 
-@app.get("/pc/list", response_model=ListResp)
+@app.get("/pc/list")
 def list_pcs(
     campaign_id: str,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
@@ -537,7 +537,7 @@ def list_pcs(
     return {"campaign_id": campaign_id, "ids": ids}
 
 
-@app.get("/npc/list", response_model=ListResp)
+@app.get("/npc/list")
 def list_npcs(
     campaign_id: str,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
