@@ -361,14 +361,17 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
 
 
 @app.get("/state")
-def api_get_state(campaign_id: str, x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY")):
+def api_get_state(
+    campaign_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
     require_api_key(x_api_key)
 
     root = campaign_root(campaign_id)
-if not root.exists():
-    if not AUTO_CREATE_CAMPAIGN:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    ensure_campaign_dirs(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
 
     paths = ensure_campaign_dirs(campaign_id)
     default_state = {
@@ -380,7 +383,7 @@ if not root.exists():
             "light": "dim",
             "threat": "low",
             "objectives": [],
-            "effects": []
+            "effects": [],
         },
         "time": {"in_world": "Unknown", "round": 0, "turn_index": 0},
         "initiative": {"active": False, "order": [], "current": 0},
