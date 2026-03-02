@@ -256,7 +256,7 @@ class RollResp(BaseModel):
     roll_id: str
     total: int
     detail: str
-    raw: List[int]
+    raw: list[int]
     text: str
     expr: str
     label: Optional[str] = None
@@ -269,10 +269,10 @@ class TurnReq(BaseModel):
     input_text: str
 
     # Rolls already performed (from /roll)
-    rolls: List[Dict[str, Any]] = Field(default_factory=list)
+    rolls: list[Dict[str, Any]] = Field(default_factory=list)
 
     # Rules / adjudication notes
-    rulings: List[str] = Field(default_factory=list)
+    rulings: list[str] = Field(default_factory=list)
 
     # Patch to apply to campaign state.json
     # Example:
