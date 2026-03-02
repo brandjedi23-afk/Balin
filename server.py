@@ -100,6 +100,50 @@ def save_json_atomic(path: Path, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def safe_read_json(path: Path, default: Any) -> Any:
+    """
+    Read JSON under an exclusive lock to avoid partial reads during writes.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with locked_open(lock_path, "w") as _lock:
+        return load_json(path, default)
+
+
+def safe_write_json(path: Path, obj: Any) -> None:
+    """
+    Write JSON under an exclusive lock + atomic replace.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with locked_open(lock_path, "w") as _lock:
+        save_json_atomic(path, obj)
+
+
+def pc_path(campaign_id: str, pc_id: str) -> Path:
+    paths = ensure_campaign_dirs(campaign_id)
+    return paths["pc_dir"] / f"pc_{pc_id}.json"
+
+
+def npc_path(campaign_id: str, npc_id: str) -> Path:
+    paths = ensure_campaign_dirs(campaign_id)
+    return paths["npc_dir"] / f"npc_{npc_id}.json"
+
+
+def list_ids_in_dir(dir_path: Path, prefix: str) -> list[str]:
+    """
+    Lists ids from files like '{prefix}_{id}.json' inside dir_path.
+    Example: prefix='pc' -> files pc_mira.json -> id 'mira'
+    """
+    if not dir_path.exists():
+        return []
+    ids: list[str] = []
+    for p in dir_path.glob(f"{prefix}_*.json"):
+        stem = p.stem  # e.g. "pc_mira"
+        if stem.startswith(prefix + "_"):
+            ids.append(stem[len(prefix) + 1 :])
+    ids.sort()
+    return ids
+
+
 # ---------
 # DOT-PATH PATCHING
 # ---------
@@ -248,6 +292,23 @@ class TurnResp(BaseModel):
     state: Dict[str, Any]
 
 
+class UpsertPCReq(BaseModel):
+    campaign_id: str
+    pc_id: str
+    sheet: Dict[str, Any] = Field(..., description="PC sheet JSON (pc_sheet.v1)")
+
+
+class UpsertNPCReq(BaseModel):
+    campaign_id: str
+    npc_id: str
+    sheet: Dict[str, Any] = Field(..., description="NPC sheet JSON (npc_sheet.v1)")
+
+
+class ListResp(BaseModel):
+    campaign_id: str
+    ids: List[str]
+
+
 # =========================
 # ROUTES
 # =========================
@@ -304,10 +365,10 @@ def api_get_state(campaign_id: str, x_api_key: Optional[str] = Header(default=No
     require_api_key(x_api_key)
 
     root = campaign_root(campaign_id)
-    if not root.exists():
-        if not AUTO_CREATE_CAMPAIGN:
-            raise HTTPException(status_code=404, detail="Campaign not found")
-        ensure_campaign_dirs(campaign_id)
+if not root.exists():
+    if not AUTO_CREATE_CAMPAIGN:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    ensure_campaign_dirs(campaign_id)
 
     paths = ensure_campaign_dirs(campaign_id)
     default_state = {
@@ -330,6 +391,168 @@ def api_get_state(campaign_id: str, x_api_key: Optional[str] = Header(default=No
     }
     state = load_json(paths["state_path"], default_state)
     return state
+
+
+@app.get("/pc")
+def get_pc(
+    campaign_id: str,
+    pc_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    # Auto-create campaign dirs if enabled
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    path = pc_path(campaign_id, pc_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="PC not found")
+
+    return safe_read_json(path, default={})
+
+
+@app.put("/pc")
+def upsert_pc(
+    req: UpsertPCReq,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    # Auto-create campaign dirs if enabled
+    root = campaign_root(req.campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(req.campaign_id)
+
+    # Minimal sanity checks (lightweight, schema validation optional)
+    req.sheet.setdefault("campaign_id", req.campaign_id)
+    req.sheet.setdefault("pc_id", req.pc_id)
+
+    path = pc_path(req.campaign_id, req.pc_id)
+    safe_write_json(path, req.sheet)
+
+    # Optional: append audit log entry (recommended)
+    paths = ensure_campaign_dirs(req.campaign_id)
+    entry = {
+        "ts_utc": utcnow_z(),
+        "campaign_id": req.campaign_id,
+        "turn_id": "pc_upsert_" + uuid.uuid4().hex[:12],
+        "speaker": "dm",
+        "input_text": f"UPSERT PC {req.pc_id}",
+        "rolls": [],
+        "rulings": [],
+        "state_patch": {"pc_sheet_upserted": req.pc_id},
+        "output_summary": "PC sheet persisted.",
+    }
+    with locked_open(paths["log_path"], "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+
+    return {"ok": True, "campaign_id": req.campaign_id, "pc_id": req.pc_id}
+
+
+@app.get("/npc")
+def get_npc(
+    campaign_id: str,
+    npc_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    # Auto-create campaign dirs if enabled
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    path = npc_path(campaign_id, npc_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="NPC not found")
+
+    return safe_read_json(path, default={})
+
+
+@app.put("/npc")
+def upsert_npc(
+    req: UpsertNPCReq,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    # Auto-create campaign dirs if enabled
+    root = campaign_root(req.campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(req.campaign_id)
+
+    # Minimal sanity checks
+    req.sheet.setdefault("campaign_id", req.campaign_id)
+    req.sheet.setdefault("npc_id", req.npc_id)
+
+    path = npc_path(req.campaign_id, req.npc_id)
+    safe_write_json(path, req.sheet)
+
+    # Optional: append audit log entry
+    paths = ensure_campaign_dirs(req.campaign_id)
+    entry = {
+        "ts_utc": utcnow_z(),
+        "campaign_id": req.campaign_id,
+        "turn_id": "npc_upsert_" + uuid.uuid4().hex[:12],
+        "speaker": "dm",
+        "input_text": f"UPSERT NPC {req.npc_id}",
+        "rolls": [],
+        "rulings": [],
+        "state_patch": {"npc_sheet_upserted": req.npc_id},
+        "output_summary": "NPC sheet persisted.",
+    }
+    with locked_open(paths["log_path"], "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+
+    return {"ok": True, "campaign_id": req.campaign_id, "npc_id": req.npc_id}
+
+
+@app.get("/pc/list", response_model=ListResp)
+def list_pcs(
+    campaign_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    paths = ensure_campaign_dirs(campaign_id)
+    ids = list_ids_in_dir(paths["pc_dir"], "pc")
+    return {"campaign_id": campaign_id, "ids": ids}
+
+
+@app.get("/npc/list", response_model=ListResp)
+def list_npcs(
+    campaign_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    paths = ensure_campaign_dirs(campaign_id)
+    ids = list_ids_in_dir(paths["npc_dir"], "npc")
+    return {"campaign_id": campaign_id, "ids": ids}
 
 
 @app.post("/turn", response_model=TurnResp)
