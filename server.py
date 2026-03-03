@@ -207,6 +207,26 @@ def apply_patch(state: Dict[str, Any], patch: Dict[str, PatchValue]) -> Dict[str
     return state
 
 
+def ensure_time_and_inc_turn_index(state: Dict[str, Any]) -> None:
+    """
+    Ensures state.time exists and increments time.turn_index by 1.
+    This is enforced on every /turn call (authoritative monotonic counter).
+    """
+    time_obj = state.get("time")
+    if not isinstance(time_obj, dict):
+        time_obj = {}
+        state["time"] = time_obj
+
+    cur = time_obj.get("turn_index", 0)
+    if not isinstance(cur, int):
+        cur = 0
+    time_obj["turn_index"] = cur + 1
+
+    # Optional: keep round key present for consistency (do not auto-increment round)
+    if "round" not in time_obj or not isinstance(time_obj.get("round"), int):
+        time_obj["round"] = 0
+
+
 # ---------
 # DICE ROLLER
 # ---------
@@ -623,6 +643,10 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
     with locked_open(lock_path, "w") as _lock:
         state = load_json(paths["state_path"], default_state)
 
+        # Prevent clients from overriding authoritative turn_index via patch
+        if "time.turn_index" in req.state_patch:
+            req.state_patch.pop("time.turn_index", None)
+        
         # Apply patch if any
         if req.state_patch:
             try:
@@ -630,7 +654,10 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid state_patch: {e}")
 
-        # Always bump updated time; optional auto-increment turn_index if you want
+        # Enforce turn counter increment on every /turn call (authoritative)
+        ensure_time_and_inc_turn_index(state)
+
+        # Always bump updated time
         state.setdefault("meta", {})
         state["meta"]["updated_utc"] = utcnow_z()
 
