@@ -99,6 +99,45 @@ def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     }
 
 
+def find_ruling(rulings_path: Path, scene_id: Optional[str], key: str) -> Optional[dict]:
+    """
+    Returns the most recent ruling matching (scene_id, key).
+    If scene_id is None, matches any scene.
+    """
+    if not rulings_path.exists():
+        return None
+
+    lock_path = rulings_path.with_suffix(rulings_path.suffix + ".lock")
+
+    with locked_open(lock_path, "w") as _lock:
+        try:
+            with open(rulings_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return None
+
+    key = key.strip()
+
+    # Search newest first
+    for line in reversed(lines):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        if obj.get("key") != key:
+            continue
+
+        if scene_id is not None and obj.get("scene_id") != scene_id:
+            continue
+
+        return obj
+
+    return None
+
+
 def read_log_tail(log_path: Path, n: int) -> list[dict]:
     """
     Reads the last n JSONL entries from log_path safely.
@@ -669,6 +708,14 @@ class RulingResp(BaseModel):
     ts_utc: str
 
 
+class RulingFindResp(BaseModel):
+    campaign_id: str
+    scene_id: Optional[str]
+    key: str
+    found: bool
+    ruling: Optional[Dict[str, Any]] = None
+
+
 class LogTailResp(BaseModel):
     campaign_id: str
     n: int
@@ -1163,6 +1210,42 @@ def snapshot(
         "pc_ids": pc_ids,
         "npc_ids": npc_ids,
         "recent_hashes": hashes,
+    }
+
+
+@app.get("/ruling/find", response_model=RulingFindResp)
+def ruling_find(
+    campaign_id: str,
+    key: str,
+    scene_id: Optional[str] = None,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    paths = ensure_campaign_dirs(campaign_id)
+
+    ruling = find_ruling(paths["rulings_path"], scene_id, key)
+
+    if not ruling:
+        return {
+            "campaign_id": campaign_id,
+            "scene_id": scene_id,
+            "key": key,
+            "found": False,
+            "ruling": None,
+        }
+
+    return {
+        "campaign_id": campaign_id,
+        "scene_id": ruling.get("scene_id"),
+        "key": key,
+        "found": True,
+        "ruling": ruling,
     }
 
 
