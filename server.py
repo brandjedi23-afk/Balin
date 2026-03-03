@@ -184,6 +184,51 @@ def find_in_log(log_path: Path, q: str, n: int) -> list[dict]:
     return out
 
 
+def recent_hashes_from_log(log_path: Path, n: int = 20) -> list[dict]:
+    """
+    Returns last n entries that contain state hashes from /turn logs.
+    Output items: {turn_id, ts_utc, prev_state_hash, new_state_hash}
+    """
+    if n < 1:
+        n = 1
+    if n > 200:
+        n = 200
+
+    if not log_path.exists():
+        return []
+
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with locked_open(lock_path, "w") as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= n:
+            break
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        # Only keep entries that have hashes (i.e., /turn entries after your upgrade)
+        if "prev_state_hash" in obj and "new_state_hash" in obj:
+            out.append({
+                "turn_id": obj.get("turn_id"),
+                "ts_utc": obj.get("ts_utc"),
+                "prev_state_hash": obj.get("prev_state_hash"),
+                "new_state_hash": obj.get("new_state_hash"),
+            })
+
+    out.reverse()
+    return out
+
+
 def locked_open(path: Path, mode: str):
     """
     Cross-process lock using fcntl (Linux). Use for state/log writes.
@@ -620,6 +665,14 @@ class LogFindResp(BaseModel):
     entries: list[Dict[str, Any]]
 
 
+class SnapshotResp(BaseModel):
+    campaign_id: str
+    state: Dict[str, Any]
+    pc_ids: list[str]
+    npc_ids: list[str]
+    recent_hashes: list[Dict[str, Any]]
+
+
 class CampaignState(BaseModel):
     schema: str
     campaign_id: str
@@ -1038,4 +1091,58 @@ def log_find(
         "n": min(max(int(n), 1), 500),
         "matches": len(entries),
         "entries": entries,
+    }
+
+
+@app.get("/snapshot", response_model=SnapshotResp)
+def snapshot(
+    campaign_id: str,
+    n_hashes: int = 20,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    paths = ensure_campaign_dirs(campaign_id)
+
+    # State
+    default_state = {
+        "schema": "dnd5e.campaign_state.v1",
+        "campaign_id": campaign_id,
+        "scene": {
+            "scene_id": "scene_001",
+            "location": "Unknown",
+            "light": "dim",
+            "threat": "low",
+            "objectives": [],
+            "effects": [],
+        },
+        "time": {"in_world": "Unknown", "round": 0, "turn_index": 0},
+        "initiative": {"active": False, "order": [], "current": 0},
+        "pcs": {},
+        "npcs": {},
+        "flags": {"revealed": [], "consequences": []},
+        "meta": {"updated_utc": utcnow_z()},
+    }
+    state_obj = safe_read_json(paths["state_path"], default_state)
+
+    # Lists
+    pc_ids = list_ids_in_dir(paths["pc_dir"], "pc")
+    npc_ids = list_ids_in_dir(paths["npc_dir"], "npc")
+
+    # Recent hashes from log
+    hashes = recent_hashes_from_log(paths["log_path"], n_hashes)
+
+    return {
+        "campaign_id": campaign_id,
+        "state": state_obj,
+        "pc_ids": pc_ids,
+        "npc_ids": npc_ids,
+        "recent_hashes": hashes,
     }
