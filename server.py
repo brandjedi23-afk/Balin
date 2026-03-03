@@ -309,6 +309,18 @@ class ListResp(BaseModel):
     ids: list[str]
 
 
+class CampaignState(BaseModel):
+    schema: str
+    campaign_id: str
+    scene: Dict[str, Any]
+    time: Dict[str, Any]
+    initiative: Dict[str, Any]
+    pcs: Dict[str, Any]
+    npcs: Dict[str, Any]
+    flags: Dict[str, Any]
+    meta: Dict[str, Any]
+
+
 # =========================
 # ROUTES
 # =========================
@@ -360,8 +372,8 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
     return resp
 
 
-@app.get("/state")
-def api_get_state(
+@app.get("/state", response_model=CampaignState)
+def state(
     campaign_id: str,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
@@ -392,7 +404,7 @@ def api_get_state(
         "flags": {"revealed": [], "consequences": []},
         "meta": {"updated_utc": utcnow_z()},
     }
-    state = load_json(paths["state_path"], default_state)
+    state = safe_read_json(paths["state_path"], default_state)
     return state
 
 
@@ -522,7 +534,7 @@ def upsert_npc(
     return {"ok": True, "campaign_id": req.campaign_id, "npc_id": req.npc_id}
 
 
-@app.get("/pc/list")
+@app.get("/pc/list", response_model=ListResp)
 def list_pcs(
     campaign_id: str,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
@@ -540,7 +552,7 @@ def list_pcs(
     return {"campaign_id": campaign_id, "ids": ids}
 
 
-@app.get("/npc/list")
+@app.get("/npc/list", response_model=ListResp)
 def list_npcs(
     campaign_id: str,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
