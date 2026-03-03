@@ -288,6 +288,13 @@ def list_ids_in_dir(dir_path: Path, prefix: str) -> list[str]:
     return ids
 
 
+PROTECTED_ROOT_KEYS = {
+    "schema",
+    "campaign_id",
+    "meta",
+}
+
+
 # ---------
 # DOT-PATH PATCHING
 # ---------
@@ -345,6 +352,35 @@ def apply_patch(state: Dict[str, Any], patch: Dict[str, PatchValue]) -> Dict[str
             # direct set
             parent[key] = v
     return state
+
+
+def validate_state_patch(patch: Dict[str, Any]) -> None:
+    """
+    Minimal safety validation:
+      - patch must be dict
+      - cannot override protected root keys
+      - cannot override full pcs/npcs/initiative objects
+      - cannot override time.turn_index (authoritative)
+    """
+    if not isinstance(patch, dict):
+        raise ValueError("state_patch must be an object")
+
+    for path in patch.keys():
+
+        # Root key detection
+        root_key = path.split(".")[0]
+
+        # Block protected top-level keys
+        if root_key in PROTECTED_ROOT_KEYS:
+            raise ValueError(f"Modification of '{root_key}' is not allowed")
+
+        # Prevent overwriting full structures
+        if path in ("pcs", "npcs", "initiative"):
+            raise ValueError(f"Overwriting '{path}' root object is not allowed")
+
+        # Prevent overriding authoritative turn counter
+        if path == "time.turn_index":
+            raise ValueError("time.turn_index is managed by the server")
 
 
 def ensure_time_and_inc_turn_index(state: Dict[str, Any]) -> None:
@@ -791,8 +827,13 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
         if "time.turn_index" in req.state_patch:
             req.state_patch.pop("time.turn_index", None)
         
-        # Apply patch if any
+        # Validate patch safety
         if req.state_patch:
+            try:
+                validate_state_patch(req.state_patch)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid state_patch: {e}")
+
             try:
                 state = apply_patch(state, req.state_patch)
             except ValueError as e:
