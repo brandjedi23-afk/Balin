@@ -11,6 +11,8 @@ import fcntl
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+import hashlib
+
 # =========================
 # ENV / PATHS
 # =========================
@@ -40,6 +42,15 @@ app = FastAPI(title="D&D 5e DM Compact API", version="1.0.0")
 
 def utcnow_z() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def state_hash(state: Dict[str, Any]) -> str:
+    """
+    Stable hash of the full campaign state.
+    Uses canonical JSON encoding (sorted keys) so the hash is deterministic.
+    """
+    payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def require_api_key(x_api_key: Optional[str]) -> None:
@@ -817,16 +828,18 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
     }
 
     # Lock state while patching
-    # (We lock via separate lock file to avoid holding lock on json while atomic replace)
     lock_path = paths["state_path"].with_suffix(".lock")
 
     with locked_open(lock_path, "w") as _lock:
         state = load_json(paths["state_path"], default_state)
 
-        # Prevent clients from overriding authoritative turn_index via patch
+        # Hash BEFORE any changes
+        prev_hash = state_hash(state)
+
+        # Prevent clients from overriding authoritative turn_index
         if "time.turn_index" in req.state_patch:
             req.state_patch.pop("time.turn_index", None)
-        
+
         # Validate patch safety
         if req.state_patch:
             try:
@@ -839,15 +852,18 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid state_patch: {e}")
 
-        # Enforce turn counter increment on every /turn call (authoritative)
+        # Enforce turn counter increment (authoritative)
         ensure_time_and_inc_turn_index(state)
 
-        # Clamp HP values (guard-rails)
+        # Clamp HP values
         enforce_hp_clamps(req.campaign_id, state)
 
         # Always bump updated time
         state.setdefault("meta", {})
         state["meta"]["updated_utc"] = utcnow_z()
+
+        # Hash AFTER all changes
+        new_hash = state_hash(state)
 
         save_json_atomic(paths["state_path"], state)
 
@@ -863,6 +879,8 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
         "rulings": req.rulings,
         "state_patch": req.state_patch,
         "output_summary": req.output_summary,
+        "prev_state_hash": prev_hash,
+        "new_state_hash": new_hash,
     }
 
     with locked_open(paths["log_path"], "a") as f:
