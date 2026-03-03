@@ -98,6 +98,42 @@ def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     }
 
 
+def read_log_tail(log_path: Path, n: int) -> list[dict]:
+    """
+    Reads the last n JSONL entries from log_path safely.
+    Simple implementation: read all lines, slice tail.
+    """
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+
+    if not log_path.exists():
+        return []
+
+    # Lock via sidecar lock file to avoid partial reads during writes
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with locked_open(lock_path, "w") as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    tail = lines[-n:]
+    out: list[dict] = []
+    for line in tail:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            # If a line is corrupted, skip it (keep endpoint resilient)
+            continue
+    return out
+
+
 def locked_open(path: Path, mode: str):
     """
     Cross-process lock using fcntl (Linux). Use for state/log writes.
@@ -520,6 +556,12 @@ class ListResp(BaseModel):
     ids: list[str]
 
 
+class LogTailResp(BaseModel):
+    campaign_id: str
+    n: int
+    entries: list[Dict[str, Any]]
+
+
 class CampaignState(BaseModel):
     schema: str
     campaign_id: str
@@ -620,6 +662,27 @@ def state(
     }
     state = safe_read_json(paths["state_path"], default_state)
     return state
+
+
+@app.get("/log/tail", response_model=LogTailResp)
+def log_tail(
+    campaign_id: str,
+    n: int = 50,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    paths = ensure_campaign_dirs(campaign_id)
+
+    entries = read_log_tail(paths["log_path"], n)
+    return {"campaign_id": campaign_id, "n": min(max(int(n), 1), 500), "entries": entries}
 
 
 @app.get("/pc")
