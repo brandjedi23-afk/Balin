@@ -134,6 +134,56 @@ def read_log_tail(log_path: Path, n: int) -> list[dict]:
     return out
 
 
+def find_in_log(log_path: Path, q: str, n: int) -> list[dict]:
+    """
+    Naive JSONL search:
+      - reads log file safely
+      - returns up to n entries where `q` is a substring of the raw JSON line
+    Notes:
+      - case-insensitive
+      - good enough for debug; later we can index if needed
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+
+    if not log_path.exists():
+        return []
+
+    q_low = q.lower()
+
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with locked_open(lock_path, "w") as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    # Search from newest to oldest (most useful for debugging)
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= n:
+            break
+        if not line:
+            continue
+        if q_low not in line.lower():
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+
+    # Return in chronological order (oldest->newest) for readability
+    out.reverse()
+    return out
+
+
 def locked_open(path: Path, mode: str):
     """
     Cross-process lock using fcntl (Linux). Use for state/log writes.
@@ -562,6 +612,14 @@ class LogTailResp(BaseModel):
     entries: list[Dict[str, Any]]
 
 
+class LogFindResp(BaseModel):
+    campaign_id: str
+    q: str
+    n: int
+    matches: int
+    entries: list[Dict[str, Any]]
+
+
 class CampaignState(BaseModel):
     schema: str
     campaign_id: str
@@ -953,3 +1011,31 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
     # Return updated state snapshot
     state = load_json(paths["state_path"], default_state)
     return {"campaign_id": req.campaign_id, "turn_id": turn_id, "state": state}
+
+
+@app.get("/log/find", response_model=LogFindResp)
+def log_find(
+    campaign_id: str,
+    q: str,
+    n: int = 200,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
+
+    root = campaign_root(campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(campaign_id)
+
+    paths = ensure_campaign_dirs(campaign_id)
+
+    entries = find_in_log(paths["log_path"], q, n)
+    return {
+        "campaign_id": campaign_id,
+        "q": q,
+        "n": min(max(int(n), 1), 500),
+        "matches": len(entries),
+        "entries": entries,
+    }
