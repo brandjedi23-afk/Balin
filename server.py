@@ -51,7 +51,11 @@ def require_api_key(x_api_key: Optional[str]) -> None:
 
 
 def campaign_root(campaign_id: str) -> Path:
-    return CAMPAIGNS_DIR / campaign_id
+    return CAMPAIGNS_DIR / norm_campaign_id(campaign_id)
+
+
+def norm_campaign_id(campaign_id: str) -> str:
+    return campaign_id.strip().lower()
 
 
 def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
@@ -353,6 +357,7 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
 
     # Optional: if campaign_id provided, append roll to log (audit)
     if req.campaign_id:
+        req.campaign_id = norm_campaign_id(req.campaign_id)
         paths = ensure_campaign_dirs(req.campaign_id)
         entry = {
             "ts_utc": resp["ts_utc"],
@@ -378,6 +383,7 @@ def state(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
 
     root = campaign_root(campaign_id)
     if not root.exists():
@@ -415,6 +421,7 @@ def get_pc(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
@@ -436,6 +443,7 @@ def upsert_pc(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    req.campaign_id = norm_campaign_id(req.campaign_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(req.campaign_id)
@@ -478,6 +486,7 @@ def get_npc(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
@@ -499,6 +508,7 @@ def upsert_npc(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    req.campaign_id = norm_campaign_id(req.campaign_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(req.campaign_id)
@@ -540,6 +550,7 @@ def list_pcs(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
 
     root = campaign_root(campaign_id)
     if not root.exists():
@@ -558,6 +569,7 @@ def list_npcs(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     require_api_key(x_api_key)
+    campaign_id = norm_campaign_id(campaign_id)
 
     root = campaign_root(campaign_id)
     if not root.exists():
@@ -573,6 +585,7 @@ def list_npcs(
 @app.post("/turn", response_model=TurnResp)
 def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY")):
     require_api_key(x_api_key)
+    req.campaign_id = norm_campaign_id(req.campaign_id)
 
     # Create campaign if allowed
     root = campaign_root(req.campaign_id)
