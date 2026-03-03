@@ -140,6 +140,138 @@ def npc_path(campaign_id: str, npc_id: str) -> Path:
     return paths["npc_dir"] / f"npc_{npc_id}.json"
 
 
+def _as_int(x: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def _dig(d: Any, path: list[str]) -> Any:
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def _extract_max_hp_from_sheet(sheet: Dict[str, Any]) -> Optional[int]:
+    """
+    Tries multiple common locations for max HP without enforcing a rigid schema.
+    Returns None if not found.
+    """
+    candidates = [
+        ["hp", "max"],
+        ["hp", "max_hp"],
+        ["hit_points", "max"],
+        ["hit_points", "max_hp"],
+        ["combat", "hp", "max"],
+        ["combat", "hp", "max_hp"],
+    ]
+    for p in candidates:
+        v = _dig(sheet, p)
+        m = _as_int(v, None)
+        if m is not None and m >= 0:
+            return m
+    return None
+
+
+def get_pc_max_hp(campaign_id: str, pc_id: str) -> Optional[int]:
+    """
+    Reads PC sheet (if present) and extracts max HP.
+    """
+    path = pc_path(campaign_id, pc_id)
+    if not path.exists():
+        return None
+    sheet = safe_read_json(path, default={})
+    if not isinstance(sheet, dict):
+        return None
+    return _extract_max_hp_from_sheet(sheet)
+
+
+def get_npc_max_hp(campaign_id: str, npc_id: str) -> Optional[int]:
+    """
+    Reads NPC sheet (if present) and extracts max HP.
+    """
+    path = npc_path(campaign_id, npc_id)
+    if not path.exists():
+        return None
+    sheet = safe_read_json(path, default={})
+    if not isinstance(sheet, dict):
+        return None
+    return _extract_max_hp_from_sheet(sheet)
+
+
+def clamp_hp_value(current: Any, max_hp: Optional[int]) -> Optional[int]:
+    c = _as_int(current, None)
+    if c is None:
+        return None
+    if c < 0:
+        c = 0
+    if max_hp is not None and max_hp >= 0 and c > max_hp:
+        c = max_hp
+    return c
+
+
+def enforce_hp_clamps(campaign_id: str, state: Dict[str, Any]) -> None:
+    """
+    Clamps HP for pcs/npcs in TEMPORARY state layer:
+      - hp.current: [0..max_hp] if max_hp known
+      - hp.temp: >= 0
+    max_hp is taken from sheet if available, otherwise from entity.hp.max if present.
+    """
+    # PCs
+    pcs = state.get("pcs")
+    if isinstance(pcs, dict):
+        for pc_id, pc_state in pcs.items():
+            if not isinstance(pc_state, dict):
+                continue
+            hp = pc_state.get("hp")
+            if not isinstance(hp, dict):
+                continue
+
+            # Determine max_hp: prefer sheet, fallback to state
+            max_hp = get_pc_max_hp(campaign_id, str(pc_id))
+            if max_hp is None:
+                max_hp = _as_int(hp.get("max") or hp.get("max_hp"), None)
+
+            new_cur = clamp_hp_value(hp.get("current"), max_hp)
+            if new_cur is not None:
+                hp["current"] = new_cur
+
+            # temp hp clamp
+            tmp = _as_int(hp.get("temp") or hp.get("temp_hp"), None)
+            if tmp is not None and tmp < 0:
+                hp["temp"] = 0
+
+    # NPCs
+    npcs = state.get("npcs")
+    if isinstance(npcs, dict):
+        for npc_id, npc_state in npcs.items():
+            if not isinstance(npc_state, dict):
+                continue
+            hp = npc_state.get("hp")
+            if not isinstance(hp, dict):
+                continue
+
+            max_hp = get_npc_max_hp(campaign_id, str(npc_id))
+            if max_hp is None:
+                max_hp = _as_int(hp.get("max") or hp.get("max_hp"), None)
+
+            new_cur = clamp_hp_value(hp.get("current"), max_hp)
+            if new_cur is not None:
+                hp["current"] = new_cur
+
+            tmp = _as_int(hp.get("temp") or hp.get("temp_hp"), None)
+            if tmp is not None and tmp < 0:
+                hp["temp"] = 0
+
+
 def list_ids_in_dir(dir_path: Path, prefix: str) -> list[str]:
     """
     Lists ids from files like '{prefix}_{id}.json' inside dir_path.
@@ -668,6 +800,9 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
 
         # Enforce turn counter increment on every /turn call (authoritative)
         ensure_time_and_inc_turn_index(state)
+
+        # Clamp HP values (guard-rails)
+        enforce_hp_clamps(req.campaign_id, state)
 
         # Always bump updated time
         state.setdefault("meta", {})
