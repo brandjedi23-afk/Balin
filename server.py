@@ -58,6 +58,14 @@ def norm_campaign_id(campaign_id: str) -> str:
     return campaign_id.strip().lower()
 
 
+def norm_pc_id(pc_id: str) -> str:
+    return pc_id.strip().lower()
+
+
+def norm_npc_id(npc_id: str) -> str:
+    return npc_id.strip().lower()
+
+
 def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     root = campaign_root(campaign_id)
     pc = root / PC_DIR
@@ -378,6 +386,7 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
     # Optional: if campaign_id provided, append roll to log (audit)
     if req.campaign_id:
         req.campaign_id = norm_campaign_id(req.campaign_id)
+        req.pc_id = norm_pc_id(req.pc_id)
         paths = ensure_campaign_dirs(req.campaign_id)
         entry = {
             "ts_utc": resp["ts_utc"],
@@ -442,6 +451,7 @@ def get_pc(
 ):
     require_api_key(x_api_key)
     campaign_id = norm_campaign_id(campaign_id)
+    pc_id = norm_pc_id(pc_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
@@ -507,6 +517,7 @@ def get_npc(
 ):
     require_api_key(x_api_key)
     campaign_id = norm_campaign_id(campaign_id)
+    npc_id = norm_npc_id(npc_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
@@ -529,6 +540,7 @@ def upsert_npc(
 ):
     require_api_key(x_api_key)
     req.campaign_id = norm_campaign_id(req.campaign_id)
+    req.npc_id = norm_npc_id(req.npc_id)
 
     # Auto-create campaign dirs if enabled
     root = campaign_root(req.campaign_id)
