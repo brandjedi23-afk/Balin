@@ -32,6 +32,7 @@ PC_DIR = os.getenv("PC_DIR", "pc")
 NPC_DIR = os.getenv("NPC_DIR", "npc")
 STATE_FILE = os.getenv("STATE_FILE", "state/state.json")
 LOG_FILE = os.getenv("LOG_FILE", "log/log.jsonl")
+RULINGS_FILE = os.getenv("RULINGS_FILE", "rulings/rulings.jsonl")
 
 app = FastAPI(title="D&D 5e DM Compact API", version="1.0.0")
 
@@ -83,18 +84,18 @@ def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     npc = root / NPC_DIR
     state = root / Path(STATE_FILE).parent
     log = root / Path(LOG_FILE).parent
+    rulings = root / Path(RULINGS_FILE).parent
 
-    for p in (pc, npc, state, log):
+    for p in (pc, npc, state, log, rulings):
         p.mkdir(parents=True, exist_ok=True)
 
-    state_path = root / STATE_FILE
-    log_path = root / LOG_FILE
     return {
         "root": root,
         "pc_dir": pc,
         "npc_dir": npc,
-        "state_path": state_path,
-        "log_path": log_path,
+        "state_path": root / STATE_FILE,
+        "log_path": root / LOG_FILE,
+        "rulings_path": root / RULINGS_FILE,
     }
 
 
@@ -651,6 +652,23 @@ class ListResp(BaseModel):
     ids: list[str]
 
 
+class RulingReq(BaseModel):
+    campaign_id: str
+    scene_id: Optional[str] = None
+    type: str  # e.g. "dc", "interpretation", "environment", etc.
+    key: str   # unique identifier, e.g. "climb_wall_dc"
+    value: Any
+    notes: Optional[str] = None
+
+
+class RulingResp(BaseModel):
+    campaign_id: str
+    scene_id: Optional[str]
+    key: str
+    stored: bool
+    ts_utc: str
+
+
 class LogTailResp(BaseModel):
     campaign_id: str
     n: int
@@ -1145,4 +1163,43 @@ def snapshot(
         "pc_ids": pc_ids,
         "npc_ids": npc_ids,
         "recent_hashes": hashes,
+    }
+
+
+@app.post("/ruling", response_model=RulingResp)
+def post_ruling(
+    req: RulingReq,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+    req.campaign_id = norm_campaign_id(req.campaign_id)
+
+    root = campaign_root(req.campaign_id)
+    if not root.exists():
+        if not AUTO_CREATE_CAMPAIGN:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        ensure_campaign_dirs(req.campaign_id)
+
+    paths = ensure_campaign_dirs(req.campaign_id)
+
+    entry = {
+        "ts_utc": utcnow_z(),
+        "campaign_id": req.campaign_id,
+        "scene_id": req.scene_id,
+        "type": req.type,
+        "key": req.key,
+        "value": req.value,
+        "notes": req.notes,
+    }
+
+    with locked_open(paths["rulings_path"], "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+
+    return {
+        "campaign_id": req.campaign_id,
+        "scene_id": req.scene_id,
+        "key": req.key,
+        "stored": True,
+        "ts_utc": entry["ts_utc"],
     }
