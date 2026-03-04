@@ -4,27 +4,29 @@ import re
 import uuid
 import random
 import datetime
-from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Union
-
-import fcntl
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
-
 import hashlib
+import fcntl
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional, Union, cast, Tuple
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field, ConfigDict
+
+from systems.registry import get_pack as registry_get_pack
+import systems  # dispara el registro (register(...) en systems/__init__.py)
 
 # =========================
 # ENV / PATHS
 # =========================
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "dnd5e-dm-compact")
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 CAMPAIGNS_DIR = Path(os.getenv("CAMPAIGNS_DIR", str(DATA_DIR / "campaigns")))
 
+DEFAULT_SYSTEM_ID = os.getenv("DEFAULT_SYSTEM_ID", "dnd5e")  # dnd5e / wot / greyhawk
 DM_API_TOKEN = os.getenv("DM_API_TOKEN", "")
 
-DEBUG_MECHANICS = os.getenv("DEBUG_MECHANICS", "true").lower() == "true"
-STRICT_DICE = os.getenv("STRICT_DICE", "true").lower() == "true"
 AUTO_CREATE_CAMPAIGN = os.getenv("AUTO_CREATE_CAMPAIGN", "true").lower() == "true"
 
 # Relative paths inside each campaign folder
@@ -36,21 +38,22 @@ RULINGS_FILE = os.getenv("RULINGS_FILE", "rulings/rulings.jsonl")
 
 app = FastAPI(title="D&D 5e DM Compact API", version="1.0.0")
 
-
 # =========================
 # HELPERS
 # =========================
+
 
 def utcnow_z() -> str:
     return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def state_hash(state: Dict[str, Any]) -> str:
-    """
-    Stable hash of the full campaign state.
-    Uses canonical JSON encoding (sorted keys) so the hash is deterministic.
-    """
-    payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(
+        state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -62,31 +65,85 @@ def require_api_key(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized (missing/invalid X-API-KEY)")
 
 
-def campaign_root(campaign_id: str) -> Path:
-    return CAMPAIGNS_DIR / norm_campaign_id(campaign_id)
+def lock_for(path: Path) -> Path:
+    """
+    Single consistent lock naming for ALL paths:
+      state.json      -> state.json.lock
+      log.jsonl       -> log.jsonl.lock
+      rulings.jsonl   -> rulings.jsonl.lock
+    """
+    return path.with_suffix(path.suffix + ".lock")
+
+
+def locked_open(path: Path, mode: str, shared: bool = False):
+    """
+    Lock file using fcntl.
+    shared=True  -> LOCK_SH (lectura)
+    shared=False -> LOCK_EX (escritura)
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, mode, encoding="utf-8")
+    lock_type = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    fcntl.flock(f.fileno(), lock_type)
+    return f
+
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
+
+
+def norm_id(s: Optional[str]) -> str:
+    if s is None:
+        return ""
+    v = s.strip().lower()
+    if not v:
+        return ""
+    if not ID_RE.match(v):
+        raise HTTPException(status_code=400, detail="Invalid id (allowed: a-z0-9 _ -; max 64)")
+    return v
 
 
 def norm_campaign_id(campaign_id: str) -> str:
-    return campaign_id.strip().lower()
+    cid = norm_id(campaign_id)
+    if not cid:
+        raise HTTPException(status_code=400, detail="campaign_id is required")
+    return cid
 
 
 def norm_pc_id(pc_id: str) -> str:
-    return pc_id.strip().lower()
+    pid = norm_id(pc_id)
+    if not pid:
+        raise HTTPException(status_code=400, detail="pc_id is required")
+    return pid
 
 
 def norm_npc_id(npc_id: str) -> str:
-    return npc_id.strip().lower()
+    nid = norm_id(npc_id)
+    if not nid:
+        raise HTTPException(status_code=400, detail="npc_id is required")
+    return nid
+
+
+def norm_system_id(s: str) -> str:
+    sid = norm_id(s)
+    if not sid:
+        raise HTTPException(status_code=400, detail="system_id is required")
+    return sid
+
+
+def campaign_root(campaign_id: str) -> Path:
+    # norm_campaign_id está definido más abajo, esto está OK
+    return CAMPAIGNS_DIR / norm_campaign_id(campaign_id)
 
 
 def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     root = campaign_root(campaign_id)
     pc = root / PC_DIR
     npc = root / NPC_DIR
-    state = root / Path(STATE_FILE).parent
-    log = root / Path(LOG_FILE).parent
-    rulings = root / Path(RULINGS_FILE).parent
+    state_dir = root / Path(STATE_FILE).parent
+    log_dir = root / Path(LOG_FILE).parent
+    rulings_dir = root / Path(RULINGS_FILE).parent
 
-    for p in (pc, npc, state, log, rulings):
+    for p in (pc, npc, state_dir, log_dir, rulings_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -99,184 +156,14 @@ def ensure_campaign_dirs(campaign_id: str) -> Dict[str, Path]:
     }
 
 
-def find_ruling(rulings_path: Path, scene_id: Optional[str], key: str) -> Optional[dict]:
-    """
-    Returns the most recent ruling matching (scene_id, key).
-    If scene_id is None, matches any scene.
-    """
-    if not rulings_path.exists():
-        return None
+def ensure_meta_defaults(state: Dict[str, Any]) -> None:
+    meta = state.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        state["meta"] = meta
 
-    lock_path = rulings_path.with_suffix(rulings_path.suffix + ".lock")
-
-    with locked_open(lock_path, "w") as _lock:
-        try:
-            with open(rulings_path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            return None
-
-    key = key.strip()
-
-    # Search newest first
-    for line in reversed(lines):
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-
-        if obj.get("key") != key:
-            continue
-
-        if scene_id is not None and obj.get("scene_id") != scene_id:
-            continue
-
-        return obj
-
-    return None
-
-
-def read_log_tail(log_path: Path, n: int) -> list[dict]:
-    """
-    Reads the last n JSONL entries from log_path safely.
-    Simple implementation: read all lines, slice tail.
-    """
-    if n < 1:
-        n = 1
-    if n > 500:
-        n = 500
-
-    if not log_path.exists():
-        return []
-
-    # Lock via sidecar lock file to avoid partial reads during writes
-    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
-    with locked_open(lock_path, "w") as _lock:
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            return []
-
-    tail = lines[-n:]
-    out: list[dict] = []
-    for line in tail:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            # If a line is corrupted, skip it (keep endpoint resilient)
-            continue
-    return out
-
-
-def find_in_log(log_path: Path, q: str, n: int) -> list[dict]:
-    """
-    Naive JSONL search:
-      - reads log file safely
-      - returns up to n entries where `q` is a substring of the raw JSON line
-    Notes:
-      - case-insensitive
-      - good enough for debug; later we can index if needed
-    """
-    q = (q or "").strip()
-    if not q:
-        return []
-
-    if n < 1:
-        n = 1
-    if n > 500:
-        n = 500
-
-    if not log_path.exists():
-        return []
-
-    q_low = q.lower()
-
-    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
-    with locked_open(lock_path, "w") as _lock:
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            return []
-
-    # Search from newest to oldest (most useful for debugging)
-    out: list[dict] = []
-    for line in reversed(lines):
-        if len(out) >= n:
-            break
-        if not line:
-            continue
-        if q_low not in line.lower():
-            continue
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
-
-    # Return in chronological order (oldest->newest) for readability
-    out.reverse()
-    return out
-
-
-def recent_hashes_from_log(log_path: Path, n: int = 20) -> list[dict]:
-    """
-    Returns last n entries that contain state hashes from /turn logs.
-    Output items: {turn_id, ts_utc, prev_state_hash, new_state_hash}
-    """
-    if n < 1:
-        n = 1
-    if n > 200:
-        n = 200
-
-    if not log_path.exists():
-        return []
-
-    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
-    with locked_open(lock_path, "w") as _lock:
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            return []
-
-    out: list[dict] = []
-    for line in reversed(lines):
-        if len(out) >= n:
-            break
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-
-        # Only keep entries that have hashes (i.e., /turn entries after your upgrade)
-        if "prev_state_hash" in obj and "new_state_hash" in obj:
-            out.append({
-                "turn_id": obj.get("turn_id"),
-                "ts_utc": obj.get("ts_utc"),
-                "prev_state_hash": obj.get("prev_state_hash"),
-                "new_state_hash": obj.get("new_state_hash"),
-            })
-
-    out.reverse()
-    return out
-
-
-def locked_open(path: Path, mode: str):
-    """
-    Cross-process lock using fcntl (Linux). Use for state/log writes.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(path, mode, encoding="utf-8")
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-    return f
+    # NO setear system_id aquí (opción A): lo decide el pack real (o el one-time set en /turn)
+    meta.setdefault("updated_utc", utcnow_z())
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -296,10 +183,11 @@ def save_json_atomic(path: Path, obj: Any) -> None:
 
 def safe_read_json(path: Path, default: Any) -> Any:
     """
-    Read JSON under an exclusive lock to avoid partial reads during writes.
+    Read JSON under a shared lock to avoid reading during an active write.
+    (Writers must use an exclusive lock on the same lockfile.)
     """
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    with locked_open(lock_path, "w") as _lock:
+    lock_path = lock_for(path)
+    with locked_open(lock_path, "a", shared=True) as _lock:
         return load_json(path, default)
 
 
@@ -307,9 +195,183 @@ def safe_write_json(path: Path, obj: Any) -> None:
     """
     Write JSON under an exclusive lock + atomic replace.
     """
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    with locked_open(lock_path, "w") as _lock:
+    lock_path = lock_for(path)
+    with locked_open(lock_path, "a") as _lock:
         save_json_atomic(path, obj)
+
+
+def iter_jsonl_reverse(path: Path, limit: int = 5000) -> list[Dict[str, Any]]:
+    """
+    Safe-ish read of last N lines (locks using lock_for(path) to coordinate with writers).
+    """
+    if not path.exists():
+        return []
+    lock_path = lock_for(path)
+    with locked_open(lock_path, "a", shared=True) as _lock:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return []
+    lines = lines[-limit:]
+    out: list[Dict[str, Any]] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(cast(Dict[str, Any], json.loads(line)))
+        except Exception:
+            continue
+    return out
+
+
+def read_log_tail(log_path: Path, n: int) -> list[dict]:
+    """
+    Reads the last n JSONL entries from log_path safely.
+    """
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+
+    if not log_path.exists():
+        return []
+
+    lock_path = lock_for(log_path)
+    with locked_open(lock_path, "a", shared=True) as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    tail = lines[-n:]
+    out: list[dict] = []
+    for line in tail:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def find_in_log(log_path: Path, q: str, n: int) -> list[dict]:
+    """
+    Naive JSONL search, newest->oldest, returns up to n entries.
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    if n < 1:
+        n = 1
+    if n > 500:
+        n = 500
+
+    if not log_path.exists():
+        return []
+
+    q_low = q.lower()
+    lock_path = lock_for(log_path)
+    with locked_open(lock_path, "a", shared=True) as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= n:
+            break
+        if not line:
+            continue
+        if q_low not in line.lower():
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+
+    out.reverse()
+    return out
+
+
+def recent_hashes_from_log(log_path: Path, n: int = 20) -> list[dict]:
+    """
+    Returns last n entries that contain state hashes from /turn logs.
+    Output items: {turn_id, ts_utc, prev_state_hash, new_state_hash}
+    """
+    if n < 1:
+        n = 1
+    if n > 200:
+        n = 200
+
+    if not log_path.exists():
+        return []
+
+    lock_path = lock_for(log_path)
+    with locked_open(lock_path, "a", shared=True) as _lock:
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    out: list[dict] = []
+    for line in reversed(lines):
+        if len(out) >= n:
+            break
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        if "prev_state_hash" in obj and "new_state_hash" in obj:
+            out.append(
+                {
+                    "turn_id": obj.get("turn_id"),
+                    "ts_utc": obj.get("ts_utc"),
+                    "prev_state_hash": obj.get("prev_state_hash"),
+                    "new_state_hash": obj.get("new_state_hash"),
+                }
+            )
+
+    out.reverse()
+    return out
+
+
+def load_state_with_system(paths: Dict[str, Path], campaign_id: str, desired_system_id: str):
+    desired_system_id = norm_system_id(desired_system_id)
+
+    # 1) pack deseado (para campañas nuevas)
+    desired_pack = registry_get_pack(desired_system_id)
+
+    # 2) carga raw (o default del pack deseado)
+    raw = load_json(paths["state_path"], desired_pack.default_state(campaign_id))
+
+    # 3) determinar system real (si raw ya lo trae)
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    actual_system_id = (
+        meta.get("system_id")
+        if isinstance(meta.get("system_id"), str) and meta.get("system_id").strip()
+        else desired_system_id
+    )
+    actual_system_id = norm_system_id(actual_system_id)
+
+    pack = registry_get_pack(actual_system_id)
+
+    # 4) migrar + normalizar
+    migrated = pack.migrate_state(raw)
+    migrated = pack.post_load_normalize(migrated)
+
+    return pack, raw, migrated
 
 
 def pc_path(campaign_id: str, pc_id: str) -> Path:
@@ -343,10 +405,6 @@ def _dig(d: Any, path: list[str]) -> Any:
 
 
 def _extract_max_hp_from_sheet(sheet: Dict[str, Any]) -> Optional[int]:
-    """
-    Tries multiple common locations for max HP without enforcing a rigid schema.
-    Returns None if not found.
-    """
     candidates = [
         ["hp", "max"],
         ["hp", "max_hp"],
@@ -364,9 +422,6 @@ def _extract_max_hp_from_sheet(sheet: Dict[str, Any]) -> Optional[int]:
 
 
 def get_pc_max_hp(campaign_id: str, pc_id: str) -> Optional[int]:
-    """
-    Reads PC sheet (if present) and extracts max HP.
-    """
     path = pc_path(campaign_id, pc_id)
     if not path.exists():
         return None
@@ -377,9 +432,6 @@ def get_pc_max_hp(campaign_id: str, pc_id: str) -> Optional[int]:
 
 
 def get_npc_max_hp(campaign_id: str, npc_id: str) -> Optional[int]:
-    """
-    Reads NPC sheet (if present) and extracts max HP.
-    """
     path = npc_path(campaign_id, npc_id)
     if not path.exists():
         return None
@@ -401,12 +453,6 @@ def clamp_hp_value(current: Any, max_hp: Optional[int]) -> Optional[int]:
 
 
 def enforce_hp_clamps(campaign_id: str, state: Dict[str, Any]) -> None:
-    """
-    Clamps HP for pcs/npcs in TEMPORARY state layer:
-      - hp.current: [0..max_hp] if max_hp known
-      - hp.temp: >= 0
-    max_hp is taken from sheet if available, otherwise from entity.hp.max if present.
-    """
     # PCs
     pcs = state.get("pcs")
     if isinstance(pcs, dict):
@@ -417,7 +463,6 @@ def enforce_hp_clamps(campaign_id: str, state: Dict[str, Any]) -> None:
             if not isinstance(hp, dict):
                 continue
 
-            # Determine max_hp: prefer sheet, fallback to state
             max_hp = get_pc_max_hp(campaign_id, str(pc_id))
             if max_hp is None:
                 max_hp = _as_int(hp.get("max") or hp.get("max_hp"), None)
@@ -426,7 +471,6 @@ def enforce_hp_clamps(campaign_id: str, state: Dict[str, Any]) -> None:
             if new_cur is not None:
                 hp["current"] = new_cur
 
-            # temp hp clamp
             tmp = _as_int(hp.get("temp") or hp.get("temp_hp"), None)
             if tmp is not None and tmp < 0:
                 hp["temp"] = 0
@@ -455,10 +499,6 @@ def enforce_hp_clamps(campaign_id: str, state: Dict[str, Any]) -> None:
 
 
 def list_ids_in_dir(dir_path: Path, prefix: str) -> list[str]:
-    """
-    Lists ids from files like '{prefix}_{id}.json' inside dir_path.
-    Example: prefix='pc' -> files pc_mira.json -> id 'mira'
-    """
     if not dir_path.exists():
         return []
     ids: list[str] = []
@@ -470,23 +510,16 @@ def list_ids_in_dir(dir_path: Path, prefix: str) -> list[str]:
     return ids
 
 
-PROTECTED_ROOT_KEYS = {
-    "schema",
-    "campaign_id",
-    "meta",
-}
-
+PROTECTED_ROOT_KEYS = {"schema", "campaign_id", "meta"}
 
 # ---------
 # DOT-PATH PATCHING
 # ---------
 
-PatchValue = Union[
-    Any,
-    Dict[str, Any],  # {"op": "inc"/"append"/"set", ...}
-]
+PatchValue = Union[Any, Dict[str, Any]]  # {"op": "inc"/"append"/"set", ...}
 
-def _get_parent_and_key(root: Dict[str, Any], path: str) -> (Dict[str, Any], str):
+
+def _get_parent_and_key(root: Dict[str, Any], path: str) -> Tuple[Dict[str, Any], str]:
     parts = [p for p in path.split(".") if p]
     if not parts:
         raise ValueError("Empty path")
@@ -499,16 +532,9 @@ def _get_parent_and_key(root: Dict[str, Any], path: str) -> (Dict[str, Any], str
 
 
 def apply_patch(state: Dict[str, Any], patch: Dict[str, PatchValue]) -> Dict[str, Any]:
-    """
-    Supports:
-      - set: {"some.path": value}
-      - inc: {"some.num": {"op":"inc","by":-4}}
-      - append: {"some.list": {"op":"append","value":X}}
-    """
     for path, v in patch.items():
         parent, key = _get_parent_and_key(state, path)
 
-        # op form
         if isinstance(v, dict) and "op" in v:
             op = v.get("op")
             if op == "set":
@@ -531,45 +557,32 @@ def apply_patch(state: Dict[str, Any], patch: Dict[str, PatchValue]) -> Dict[str
             else:
                 raise ValueError(f"Unknown op: {op}")
         else:
-            # direct set
             parent[key] = v
     return state
 
 
 def validate_state_patch(patch: Dict[str, Any]) -> None:
-    """
-    Minimal safety validation:
-      - patch must be dict
-      - cannot override protected root keys
-      - cannot override full pcs/npcs/initiative objects
-      - cannot override time.turn_index (authoritative)
-    """
     if not isinstance(patch, dict):
         raise ValueError("state_patch must be an object")
 
     for path in patch.keys():
+        if path == "meta":
+            raise ValueError("Modification of 'meta' is not allowed")
+        if path.startswith("meta.") and path != "meta.system_id":
+            raise ValueError("Modification of 'meta.*' is not allowed (except meta.system_id)")
 
-        # Root key detection
+        if path == "time.turn_index":
+            raise ValueError("Modification of 'time.turn_index' is not allowed")
+
         root_key = path.split(".")[0]
-
-        # Block protected top-level keys
-        if root_key in PROTECTED_ROOT_KEYS:
+        if root_key in PROTECTED_ROOT_KEYS and path != "meta.system_id":
             raise ValueError(f"Modification of '{root_key}' is not allowed")
 
-        # Prevent overwriting full structures
         if path in ("pcs", "npcs", "initiative"):
             raise ValueError(f"Overwriting '{path}' root object is not allowed")
 
-        # Prevent overriding authoritative turn counter
-        if path == "time.turn_index":
-            raise ValueError("time.turn_index is managed by the server")
-
 
 def ensure_time_and_inc_turn_index(state: Dict[str, Any]) -> None:
-    """
-    Ensures state.time exists and increments time.turn_index by 1.
-    This is enforced on every /turn call (authoritative monotonic counter).
-    """
     time_obj = state.get("time")
     if not isinstance(time_obj, dict):
         time_obj = {}
@@ -580,7 +593,6 @@ def ensure_time_and_inc_turn_index(state: Dict[str, Any]) -> None:
         cur = 0
     time_obj["turn_index"] = cur + 1
 
-    # Optional: keep round key present for consistency (do not auto-increment round)
     if "round" not in time_obj or not isinstance(time_obj.get("round"), int):
         time_obj["round"] = 0
 
@@ -591,11 +603,8 @@ def ensure_time_and_inc_turn_index(state: Dict[str, Any]) -> None:
 
 DICE_RE = re.compile(r"^\s*(\d*)d(\d+)\s*([+-]\s*\d+)?\s*$", re.IGNORECASE)
 
+
 def roll_expr(expr: str) -> Dict[str, Any]:
-    """
-    Minimal dice: NdM(+/-)K  e.g. '1d20+5', '2d6-1'
-    Returns: total, detail, raw list, text.
-    """
     m = DICE_RE.match(expr)
     if not m:
         raise ValueError("Unsupported dice expression. Use NdM+K, e.g. 1d20+5")
@@ -614,7 +623,6 @@ def roll_expr(expr: str) -> Dict[str, Any]:
     subtotal = sum(rolls)
     total = subtotal + mod
 
-    # detail string: "4+2+6+3"
     detail = "+".join(str(r) for r in rolls)
     if mod != 0:
         sign = "+" if mod > 0 else "-"
@@ -627,6 +635,7 @@ def roll_expr(expr: str) -> Dict[str, Any]:
 # =========================
 # MODELS
 # =========================
+
 
 class RollReq(BaseModel):
     expr: str = Field(..., description="Dice expression, e.g. 1d20+5")
@@ -649,22 +658,9 @@ class TurnReq(BaseModel):
     campaign_id: str
     speaker: Literal["player", "dm"] = "player"
     input_text: str
-
-    # Rolls already performed (from /roll)
     rolls: list[Dict[str, Any]] = Field(default_factory=list)
-
-    # Rules / adjudication notes
     rulings: list[str] = Field(default_factory=list)
-
-    # Patch to apply to campaign state.json
-    # Example:
-    # {
-    #   "time.turn_index": {"op":"inc","by":1},
-    #   "flags.revealed": {"op":"append","value":"Tripwire found"},
-    #   "pcs.pc_mira.hp.current": {"op":"inc","by":-4}
-    # }
     state_patch: Dict[str, Any] = Field(default_factory=dict)
-
     output_summary: str = ""
 
 
@@ -694,15 +690,17 @@ class ListResp(BaseModel):
 class RulingReq(BaseModel):
     campaign_id: str
     scene_id: Optional[str] = None
-    type: str  # e.g. "dc", "interpretation", "environment", etc.
-    key: str   # unique identifier, e.g. "climb_wall_dc"
+    scope: Literal["scene", "global"] = "scene"
+    type: str
+    key: str
     value: Any
     notes: Optional[str] = None
 
 
 class RulingResp(BaseModel):
     campaign_id: str
-    scene_id: Optional[str]
+    scene_id: Optional[str] = None
+    scope: Literal["scene", "global"]
     key: str
     stored: bool
     ts_utc: str
@@ -710,7 +708,8 @@ class RulingResp(BaseModel):
 
 class RulingFindResp(BaseModel):
     campaign_id: str
-    scene_id: Optional[str]
+    scene_id: Optional[str] = None
+    scope: Literal["scene", "global"]
     key: str
     found: bool
     ruling: Optional[Dict[str, Any]] = None
@@ -739,15 +738,20 @@ class SnapshotResp(BaseModel):
 
 
 class CampaignState(BaseModel):
-    schema: str
-    campaign_id: str
-    scene: Dict[str, Any]
-    time: Dict[str, Any]
-    initiative: Dict[str, Any]
-    pcs: Dict[str, Any]
-    npcs: Dict[str, Any]
-    flags: Dict[str, Any]
-    meta: Dict[str, Any]
+    # Permite que cada SystemPack añada claves propias sin romper el response_model
+    model_config = ConfigDict(extra="allow")
+
+    # “tolerante”: si un pack no lo garantiza, no revienta
+    schema: Optional[str] = None
+    campaign_id: Optional[str] = None
+
+    scene: Dict[str, Any] = Field(default_factory=dict)
+    time: Dict[str, Any] = Field(default_factory=dict)
+    initiative: Dict[str, Any] = Field(default_factory=dict)
+    pcs: Dict[str, Any] = Field(default_factory=dict)
+    npcs: Dict[str, Any] = Field(default_factory=dict)
+    flags: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
 
 # =========================
@@ -783,7 +787,6 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
     # Optional: if campaign_id provided, append roll to log (audit)
     if req.campaign_id:
         req.campaign_id = norm_campaign_id(req.campaign_id)
-        req.pc_id = norm_pc_id(req.pc_id)
         paths = ensure_campaign_dirs(req.campaign_id)
         entry = {
             "ts_utc": resp["ts_utc"],
@@ -796,9 +799,12 @@ def api_roll(req: RollReq, x_api_key: Optional[str] = Header(default=None, alias
             "state_patch": {},
             "output_summary": resp["text"],
         }
-        with locked_open(paths["log_path"], "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            f.flush()
+
+        log_lock = lock_for(paths["log_path"])
+        with locked_open(log_lock, "w") as _lock:
+            with open(paths["log_path"], "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.flush()
 
     return resp
 
@@ -818,26 +824,81 @@ def state(
         ensure_campaign_dirs(campaign_id)
 
     paths = ensure_campaign_dirs(campaign_id)
-    default_state = {
-        "schema": "dnd5e.campaign_state.v1",
-        "campaign_id": campaign_id,
-        "scene": {
-            "scene_id": "scene_001",
-            "location": "Unknown",
-            "light": "dim",
-            "threat": "low",
-            "objectives": [],
-            "effects": [],
-        },
-        "time": {"in_world": "Unknown", "round": 0, "turn_index": 0},
-        "initiative": {"active": False, "order": [], "current": 0},
-        "pcs": {},
-        "npcs": {},
-        "flags": {"revealed": [], "consequences": []},
-        "meta": {"updated_utc": utcnow_z()},
+
+    pack, _raw, migrated = load_state_with_system(paths, campaign_id, DEFAULT_SYSTEM_ID)
+
+    ensure_meta_defaults(migrated)
+    migrated.setdefault("meta", {})
+    migrated["meta"].setdefault("system_id", pack.system_id)
+
+    return migrated
+
+
+@app.post("/ruling", response_model=RulingResp)
+def post_ruling(req: RulingReq, x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY")):
+    require_api_key(x_api_key)
+
+    cid = norm_campaign_id(req.campaign_id)
+    paths = ensure_campaign_dirs(cid)
+
+    scene_id = norm_id(req.scene_id) if req.scene_id else None
+    scope = req.scope
+    if scope == "global":
+        scene_id = None
+
+    entry = {
+        "ts_utc": utcnow_z(),
+        "campaign_id": cid,
+        "scene_id": scene_id,
+        "scope": scope,
+        "type": req.type,
+        "key": req.key.strip(),
+        "value": req.value,
+        "notes": req.notes,
     }
-    state = safe_read_json(paths["state_path"], default_state)
-    return state
+
+    rulings_lock = lock_for(paths["rulings_path"])
+    with locked_open(rulings_lock, "w") as _lock:
+        with open(paths["rulings_path"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+
+    return {"campaign_id": cid, "scene_id": scene_id, "scope": scope, "key": entry["key"], "stored": True, "ts_utc": entry["ts_utc"]}
+
+
+@app.get("/ruling/find", response_model=RulingFindResp)
+def ruling_find(
+    campaign_id: str,
+    key: str,
+    scene_id: Optional[str] = None,
+    scope: Literal["scene", "global"] = "scene",
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    require_api_key(x_api_key)
+
+    cid = norm_campaign_id(campaign_id)
+    paths = ensure_campaign_dirs(cid)
+    key = key.strip()
+    wanted_scene = norm_id(scene_id) if scene_id else None
+
+    entries = iter_jsonl_reverse(paths["rulings_path"], limit=5000)
+
+    if scope == "scene" and wanted_scene:
+        for e in entries:
+            if e.get("key") == key and e.get("scope") == "scene" and e.get("scene_id") == wanted_scene:
+                return {"campaign_id": cid, "scene_id": wanted_scene, "scope": "scene", "key": key, "found": True, "ruling": e}
+
+        for e in entries:
+            if e.get("key") == key and e.get("scope") == "global":
+                return {"campaign_id": cid, "scene_id": None, "scope": "global", "key": key, "found": True, "ruling": e}
+
+        return {"campaign_id": cid, "scene_id": wanted_scene, "scope": "scene", "key": key, "found": False, "ruling": None}
+
+    for e in entries:
+        if e.get("key") == key and e.get("scope") == "global":
+            return {"campaign_id": cid, "scene_id": None, "scope": "global", "key": key, "found": True, "ruling": e}
+
+    return {"campaign_id": cid, "scene_id": None, "scope": "global", "key": key, "found": False, "ruling": None}
 
 
 @app.get("/log/tail", response_model=LogTailResp)
@@ -871,7 +932,6 @@ def get_pc(
     campaign_id = norm_campaign_id(campaign_id)
     pc_id = norm_pc_id(pc_id)
 
-    # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
     if not root.exists():
         if not AUTO_CREATE_CAMPAIGN:
@@ -893,21 +953,18 @@ def upsert_pc(
     require_api_key(x_api_key)
     req.campaign_id = norm_campaign_id(req.campaign_id)
 
-    # Auto-create campaign dirs if enabled
     root = campaign_root(req.campaign_id)
     if not root.exists():
         if not AUTO_CREATE_CAMPAIGN:
             raise HTTPException(status_code=404, detail="Campaign not found")
         ensure_campaign_dirs(req.campaign_id)
 
-    # Minimal sanity checks (lightweight, schema validation optional)
     req.sheet.setdefault("campaign_id", req.campaign_id)
     req.sheet.setdefault("pc_id", req.pc_id)
 
     path = pc_path(req.campaign_id, req.pc_id)
     safe_write_json(path, req.sheet)
 
-    # Optional: append audit log entry (recommended)
     paths = ensure_campaign_dirs(req.campaign_id)
     entry = {
         "ts_utc": utcnow_z(),
@@ -920,9 +977,11 @@ def upsert_pc(
         "state_patch": {"pc_sheet_upserted": req.pc_id},
         "output_summary": "PC sheet persisted.",
     }
-    with locked_open(paths["log_path"], "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        f.flush()
+    log_lock = lock_for(paths["log_path"])
+    with locked_open(log_lock, "w") as _lock:
+        with open(paths["log_path"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
 
     return {"ok": True, "campaign_id": req.campaign_id, "pc_id": req.pc_id}
 
@@ -937,7 +996,6 @@ def get_npc(
     campaign_id = norm_campaign_id(campaign_id)
     npc_id = norm_npc_id(npc_id)
 
-    # Auto-create campaign dirs if enabled
     root = campaign_root(campaign_id)
     if not root.exists():
         if not AUTO_CREATE_CAMPAIGN:
@@ -960,21 +1018,18 @@ def upsert_npc(
     req.campaign_id = norm_campaign_id(req.campaign_id)
     req.npc_id = norm_npc_id(req.npc_id)
 
-    # Auto-create campaign dirs if enabled
     root = campaign_root(req.campaign_id)
     if not root.exists():
         if not AUTO_CREATE_CAMPAIGN:
             raise HTTPException(status_code=404, detail="Campaign not found")
         ensure_campaign_dirs(req.campaign_id)
 
-    # Minimal sanity checks
     req.sheet.setdefault("campaign_id", req.campaign_id)
     req.sheet.setdefault("npc_id", req.npc_id)
 
     path = npc_path(req.campaign_id, req.npc_id)
     safe_write_json(path, req.sheet)
 
-    # Optional: append audit log entry
     paths = ensure_campaign_dirs(req.campaign_id)
     entry = {
         "ts_utc": utcnow_z(),
@@ -987,9 +1042,11 @@ def upsert_npc(
         "state_patch": {"npc_sheet_upserted": req.npc_id},
         "output_summary": "NPC sheet persisted.",
     }
-    with locked_open(paths["log_path"], "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        f.flush()
+    log_lock = lock_for(paths["log_path"])
+    with locked_open(log_lock, "w") as _lock:
+        with open(paths["log_path"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
 
     return {"ok": True, "campaign_id": req.campaign_id, "npc_id": req.npc_id}
 
@@ -1037,7 +1094,6 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
     require_api_key(x_api_key)
     req.campaign_id = norm_campaign_id(req.campaign_id)
 
-    # Create campaign if allowed
     root = campaign_root(req.campaign_id)
     if not root.exists():
         if not AUTO_CREATE_CAMPAIGN:
@@ -1046,40 +1102,65 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
 
     paths = ensure_campaign_dirs(req.campaign_id)
 
-    # Load state
-    default_state = {
-        "schema": "dnd5e.campaign_state.v1",
-        "campaign_id": req.campaign_id,
-        "scene": {
-            "scene_id": "scene_001",
-            "location": "Unknown",
-            "light": "dim",
-            "threat": "low",
-            "objectives": [],
-            "effects": []
-        },
-        "time": {"in_world": "Unknown", "round": 0, "turn_index": 0},
-        "initiative": {"active": False, "order": [], "current": 0},
-        "pcs": {},
-        "npcs": {},
-        "flags": {"revealed": [], "consequences": []},
-        "meta": {"updated_utc": utcnow_z()},
-    }
+    # Lock state while patching (CONSISTENT lock file)
+    state_lock = lock_for(paths["state_path"])
 
-    # Lock state while patching
-    lock_path = paths["state_path"].with_suffix(".lock")
+    def _extract_desired_system_id(patch: Any) -> Optional[str]:
+        if not isinstance(patch, dict):
+            return None
+        if "meta.system_id" not in patch:
+            return None
 
-    with locked_open(lock_path, "w") as _lock:
-        state = load_json(paths["state_path"], default_state)
+        desired = patch.get("meta.system_id")
+        if isinstance(desired, dict) and desired.get("op") == "set":
+            desired = desired.get("value")
 
-        # Hash BEFORE any changes
-        prev_hash = state_hash(state)
+        if isinstance(desired, str) and desired.strip():
+            return norm_system_id(desired)
 
-        # Prevent clients from overriding authoritative turn_index
-        if "time.turn_index" in req.state_patch:
+        return None
+
+    with locked_open(state_lock, "w") as _lock:
+        desired_from_patch = _extract_desired_system_id(req.state_patch)
+        desired_system_id = desired_from_patch or DEFAULT_SYSTEM_ID
+
+        pack, raw_state, state_obj = load_state_with_system(paths, req.campaign_id, desired_system_id)
+
+        state_obj.setdefault("meta", {})
+        if not isinstance(state_obj["meta"], dict):
+            state_obj["meta"] = {}
+        state_obj["meta"]["updated_utc"] = utcnow_z()
+
+        # One-time system_id set
+        if isinstance(req.state_patch, dict) and "meta.system_id" in req.state_patch:
+            raw_meta = raw_state.get("meta") if isinstance(raw_state.get("meta"), dict) else {}
+            current_raw = raw_meta.get("system_id")
+
+            if isinstance(current_raw, str) and current_raw.strip():
+                req.state_patch.pop("meta.system_id", None)
+            else:
+                if desired_from_patch is None:
+                    raise HTTPException(status_code=400, detail="meta.system_id must be a non-empty string")
+
+                state_obj["meta"]["system_id"] = desired_from_patch
+
+                pack = registry_get_pack(desired_from_patch)
+                state_obj = pack.migrate_state(state_obj)
+                state_obj = pack.post_load_normalize(state_obj)
+
+                req.state_patch.pop("meta.system_id", None)
+
+        state_obj.setdefault("meta", {})
+        if not isinstance(state_obj["meta"], dict):
+            state_obj["meta"] = {}
+        state_obj["meta"].setdefault("system_id", pack.system_id)
+        state_obj["meta"]["updated_utc"] = utcnow_z()
+
+        prev_hash = state_hash(state_obj)
+
+        if isinstance(req.state_patch, dict) and "time.turn_index" in req.state_patch:
             req.state_patch.pop("time.turn_index", None)
 
-        # Validate patch safety
         if req.state_patch:
             try:
                 validate_state_patch(req.state_patch)
@@ -1087,26 +1168,24 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
                 raise HTTPException(status_code=400, detail=f"Invalid state_patch: {e}")
 
             try:
-                state = apply_patch(state, req.state_patch)
+                state_obj = apply_patch(state_obj, cast(Dict[str, Any], req.state_patch))
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid state_patch: {e}")
 
-        # Enforce turn counter increment (authoritative)
-        ensure_time_and_inc_turn_index(state)
+        ensure_time_and_inc_turn_index(state_obj)
+        enforce_hp_clamps(req.campaign_id, state_obj)
 
-        # Clamp HP values
-        enforce_hp_clamps(req.campaign_id, state)
+        state_obj.setdefault("meta", {})
+        if not isinstance(state_obj["meta"], dict):
+            state_obj["meta"] = {}
+        state_obj["meta"].setdefault("system_id", pack.system_id)
+        state_obj["meta"]["updated_utc"] = utcnow_z()
 
-        # Always bump updated time
-        state.setdefault("meta", {})
-        state["meta"]["updated_utc"] = utcnow_z()
+        new_hash = state_hash(state_obj)
 
-        # Hash AFTER all changes
-        new_hash = state_hash(state)
+        save_json_atomic(paths["state_path"], state_obj)
 
-        save_json_atomic(paths["state_path"], state)
-
-    # Append to log (JSONL)
+    # Append to log AFTER releasing state lock (lock sidecar consistently)
     turn_id = "turn_" + uuid.uuid4().hex[:12]
     entry = {
         "ts_utc": utcnow_z(),
@@ -1120,15 +1199,21 @@ def api_turn(req: TurnReq, x_api_key: Optional[str] = Header(default=None, alias
         "output_summary": req.output_summary,
         "prev_state_hash": prev_hash,
         "new_state_hash": new_hash,
+        "system_id": pack.system_id,
+        "schema": state_obj.get("schema"),
     }
 
-    with locked_open(paths["log_path"], "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        f.flush()
+    log_lock = lock_for(paths["log_path"])
+    with locked_open(log_lock, "w") as _lock:
+        with open(paths["log_path"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
 
-    # Return updated state snapshot
-    state = load_json(paths["state_path"], default_state)
-    return {"campaign_id": req.campaign_id, "turn_id": turn_id, "state": state}
+    final_pack = registry_get_pack(pack.system_id)
+    final_default = final_pack.default_state(req.campaign_id)
+    state_out = safe_read_json(paths["state_path"], final_default)
+
+    return {"campaign_id": req.campaign_id, "turn_id": turn_id, "state": state_out}
 
 
 @app.get("/log/find", response_model=LogFindResp)
@@ -1176,113 +1261,19 @@ def snapshot(
 
     paths = ensure_campaign_dirs(campaign_id)
 
-    # State
-    default_state = {
-        "schema": "dnd5e.campaign_state.v1",
-        "campaign_id": campaign_id,
-        "scene": {
-            "scene_id": "scene_001",
-            "location": "Unknown",
-            "light": "dim",
-            "threat": "low",
-            "objectives": [],
-            "effects": [],
-        },
-        "time": {"in_world": "Unknown", "round": 0, "turn_index": 0},
-        "initiative": {"active": False, "order": [], "current": 0},
-        "pcs": {},
-        "npcs": {},
-        "flags": {"revealed": [], "consequences": []},
-        "meta": {"updated_utc": utcnow_z()},
-    }
-    state_obj = safe_read_json(paths["state_path"], default_state)
+    pack, _raw, migrated = load_state_with_system(paths, campaign_id, DEFAULT_SYSTEM_ID)
+    ensure_meta_defaults(migrated)
+    migrated.setdefault("meta", {})
+    migrated["meta"].setdefault("system_id", pack.system_id)
 
-    # Lists
     pc_ids = list_ids_in_dir(paths["pc_dir"], "pc")
     npc_ids = list_ids_in_dir(paths["npc_dir"], "npc")
-
-    # Recent hashes from log
     hashes = recent_hashes_from_log(paths["log_path"], n_hashes)
 
     return {
         "campaign_id": campaign_id,
-        "state": state_obj,
+        "state": migrated,
         "pc_ids": pc_ids,
         "npc_ids": npc_ids,
         "recent_hashes": hashes,
-    }
-
-
-@app.get("/ruling/find", response_model=RulingFindResp)
-def ruling_find(
-    campaign_id: str,
-    key: str,
-    scene_id: Optional[str] = None,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
-):
-    require_api_key(x_api_key)
-    campaign_id = norm_campaign_id(campaign_id)
-
-    root = campaign_root(campaign_id)
-    if not root.exists():
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    paths = ensure_campaign_dirs(campaign_id)
-
-    ruling = find_ruling(paths["rulings_path"], scene_id, key)
-
-    if not ruling:
-        return {
-            "campaign_id": campaign_id,
-            "scene_id": scene_id,
-            "key": key,
-            "found": False,
-            "ruling": None,
-        }
-
-    return {
-        "campaign_id": campaign_id,
-        "scene_id": ruling.get("scene_id"),
-        "key": key,
-        "found": True,
-        "ruling": ruling,
-    }
-
-
-@app.post("/ruling", response_model=RulingResp)
-def post_ruling(
-    req: RulingReq,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
-):
-    require_api_key(x_api_key)
-    req.campaign_id = norm_campaign_id(req.campaign_id)
-
-    root = campaign_root(req.campaign_id)
-    if not root.exists():
-        if not AUTO_CREATE_CAMPAIGN:
-            raise HTTPException(status_code=404, detail="Campaign not found")
-        ensure_campaign_dirs(req.campaign_id)
-
-    paths = ensure_campaign_dirs(req.campaign_id)
-
-    entry = {
-        "ts_utc": utcnow_z(),
-        "campaign_id": req.campaign_id,
-        "scene_id": req.scene_id,
-        "type": req.type,
-        "key": req.key,
-        "value": req.value,
-        "notes": req.notes,
-    }
-
-    with locked_open(paths["rulings_path"], "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        f.flush()
-
-    return {
-        "campaign_id": req.campaign_id,
-        "scene_id": req.scene_id,
-        "key": req.key,
-        "stored": True,
-        "ts_utc": entry["ts_utc"],
     }
