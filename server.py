@@ -22,7 +22,7 @@ import systems  # dispara el registro (register(...) en systems/__init__.py)
 SERVICE_NAME = os.getenv("SERVICE_NAME", "dnd5e-dm-compact")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
-CAMPAIGNS_DIR = Path(os.getenv("CAMPAIGNS_DIR", str(DATA_DIR / "campaigns")))
+CAMPAIGNS_DIR = DATA_DIR / "campaigns"
 
 DEFAULT_SYSTEM_ID = os.getenv("DEFAULT_SYSTEM_ID", "dnd5e")  # dnd5e / wot / greyhawk
 DM_API_TOKEN = os.getenv("DM_API_TOKEN", "")
@@ -86,6 +86,31 @@ def locked_open(path: Path, mode: str, shared: bool = False):
     lock_type = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     fcntl.flock(f.fileno(), lock_type)
     return f
+
+
+def state_path(campaign_id: str) -> Path:
+    # opcional: sanitiza para evitar rutas raras
+    safe = "".join(c for c in campaign_id if c.isalnum() or c in ("-", "_"))
+    return CAMPAIGNS_DIR / safe / "state.json"
+
+def load_state_or_default(campaign_id: str) -> dict:
+    p = state_path(campaign_id)
+    try:
+        if not p.exists():
+            st = default_state(campaign_id)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+            return st
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        # estado corrupto -> no 500, devuelve default (o renombra y recrea)
+        st = default_state(campaign_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+        return st
+    except Exception as e:
+        # aquí NO quieres 500 sin contexto
+        raise HTTPException(status_code=500, detail=f"Failed to load state: {type(e).__name__}: {e}")
 
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
@@ -832,6 +857,11 @@ def state(
     migrated["meta"].setdefault("system_id", pack.system_id)
 
     return migrated
+
+
+@app.get("/state")
+def get_state(campaign_id: str):
+    return load_state_or_default(campaign_id)
 
 
 @app.post("/ruling", response_model=RulingResp)
