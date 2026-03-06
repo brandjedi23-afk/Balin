@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -274,6 +275,12 @@ class ListResp(BaseModel):
     ids: List[str]
 
 
+class DeleteCampaignResp(BaseModel):
+    ok: bool
+    campaign_id: str
+    deleted: bool
+    root: str
+
 class LogTailResp(BaseModel):
     campaign_id: str
     n: int
@@ -373,63 +380,54 @@ def load_state_or_create(campaign_id: str) -> Dict[str, Any]:
     ensure_campaign_dirs(campaign_id)
     path = state_file(campaign_id)
 
-    # 1) lee estado existente o crea base
     existing = safe_read_json(path, default=None)
-    system_id = get_campaign_system_id(campaign_id, existing)
-    base = default_state(campaign_id, system_id)
+    if not isinstance(existing, dict):
+        existing = {}
 
-    st = existing if isinstance(existing, dict) else base
+    # 1) system_id: del state si existe; si no, DEFAULT_SYSTEM
+    meta = existing.get("meta") or {}
+    system_id = (meta.get("system_id") or DEFAULT_SYSTEM).strip().lower()
 
-    # 2) “self-heal” para cumplir schema requerido
-    merged = {**base, **(st or {})}
-    for k in ("scene", "time", "initiative", "flags", "meta"):
-        merged[k] = {**base[k], **(merged.get(k) or {})}
-
-    merged["schema"] = merged.get("schema") or base["schema"]
-    merged["campaign_id"] = campaign_id
-    merged["meta"]["system_id"] = system_id
-    merged["meta"]["updated_utc"] = utcnow_iso()
-
-    # 3) aplica pack (si existe) para bootstrap/migraciones
-    pack, pack_err = None, None
+    # 2) intenta cargar pack sin romper el server
+    pack = None
+    pack_err = None
     try:
         pack = registry_get_pack(system_id)
     except Exception as e:
         pack_err = f"{type(e).__name__}: {e}"
         pack = None
 
-    if pack is not None:
-        # 3.a) si el pack ofrece default_state, mezcla con prioridad del state existente
+    # 3) base_state: del pack si existe, o default global
+    base = default_state(campaign_id, system_id)  # tu default global (válido)
+    if pack is not None and hasattr(pack, "default_state") and callable(pack.default_state):
         try:
-            if hasattr(pack, "default_state") and callable(pack.default_state):
-                pack_base = pack.default_state(campaign_id)  # debe devolver dict compatible
-                if isinstance(pack_base, dict):
-                    # pack_base -> base -> st (st gana)
-                    merged = {**pack_base, **merged}
-                    # y asegura claves críticas de meta
-                    merged["meta"] = merged.get("meta") or {}
-                    merged["meta"]["system_id"] = system_id
-                    merged["meta"]["updated_utc"] = utcnow_iso()
+            pack_base = pack.default_state(campaign_id)
+            if isinstance(pack_base, dict):
+                base = {**base, **pack_base}  # pack puede sobreescribir campos
         except Exception as e:
-            merged["meta"]["pack_warning"] = f"default_state failed: {type(e).__name__}: {e}"
+            existing.setdefault("meta", {})
+            existing["meta"]["pack_warning"] = f"default_state failed: {type(e).__name__}: {e}"
 
-        # 3.b) si el pack ofrece ensure_campaign, ejecútalo (crear carpetas/seed)
+    # 4) merge + self-heal (evita 500 por schema incompleto)
+    merged = {**base, **existing}
+    for k in ("scene", "time", "initiative", "flags", "meta"):
+        merged[k] = {**(base.get(k) or {}), **(merged.get(k) or {})}
+
+    merged["schema"] = merged.get("schema") or base["schema"]
+    merged["campaign_id"] = campaign_id
+    merged["meta"]["system_id"] = system_id
+    merged["meta"]["updated_utc"] = utcnow_iso()
+
+    # 5) ensure_campaign del pack (opcional, nunca romper)
+    if pack is not None and hasattr(pack, "ensure_campaign") and callable(pack.ensure_campaign):
         try:
-            if hasattr(pack, "ensure_campaign") and callable(pack.ensure_campaign):
-                pack.ensure_campaign(campaign_root(campaign_id), campaign_id)
+            pack.ensure_campaign(campaign_root(campaign_id), campaign_id)
         except Exception as e:
             merged["meta"]["pack_warning"] = f"ensure_campaign failed: {type(e).__name__}: {e}"
 
-        # 3.c) si el pack ofrece migrations(), puedes registrarlas (sin aplicarlas si no quieres)
-        try:
-            if hasattr(pack, "migrations") and callable(pack.migrations):
-                migs = pack.migrations()
-                merged["meta"]["migrations"] = migs if isinstance(migs, list) else []
-        except Exception as e:
-            merged["meta"]["pack_warning"] = f"migrations failed: {type(e).__name__}: {e}"
-    else:
-        if pack_err:
-            merged["meta"]["pack_warning"] = f"Pack not available for '{system_id}': {pack_err}"
+    # 6) si el pack no cargó, deja warning
+    if pack is None and pack_err:
+        merged["meta"]["pack_warning"] = f"Pack not available for '{system_id}': {pack_err}"
 
     safe_write_json(path, merged)
     return merged
@@ -632,6 +630,30 @@ def get_state(campaign_id: str = Query(...), system_id: Optional[str] = Query(No
 
     st2 = load_state_or_create(campaign_id)
     return CampaignState.model_validate(st2)
+
+
+@app.delete("/campaign", response_model=DeleteCampaignResp, dependencies=[Depends(require_api_key)])
+def delete_campaign(campaign_id: str = Query(...)) -> DeleteCampaignResp:
+    root = campaign_root(campaign_id)
+
+    if not root.exists():
+        return DeleteCampaignResp(
+            ok=True,
+            campaign_id=campaign_id,
+            deleted=False,
+            root=str(root),
+        )
+
+    # Borra completamente la carpeta de campaña:
+    # state/, pcs/, npcs/, log.jsonl, rulings.jsonl, locks, etc.
+    shutil.rmtree(root)
+
+    return DeleteCampaignResp(
+        ok=True,
+        campaign_id=campaign_id,
+        deleted=True,
+        root=str(root),
+    )
 
 
 @app.post("/turn", response_model=TurnResp, dependencies=[Depends(require_api_key)])
